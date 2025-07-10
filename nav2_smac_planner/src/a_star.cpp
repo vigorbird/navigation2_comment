@@ -340,8 +340,9 @@ bool AStarAlgorithm<NodeT>::createPath(
   }
 
   NodeVector coarse_check_goals, fine_check_goals;
-  _goal_manager.prepareGoalsForAnalyticExpansion(coarse_check_goals, fine_check_goals,
-    _coarse_search_resolution);
+  _goal_manager.prepareGoalsForAnalyticExpansion(coarse_check_goals, 
+                                                  fine_check_goals,
+                                                  _coarse_search_resolution);
 
   // 0) Add starting point to the open set
   addNode(0.0, getStart());
@@ -360,8 +361,8 @@ bool AStarAlgorithm<NodeT>::createPath(
 
   // Given an index, return a node ptr reference if its collision-free and valid
   const uint64_t max_index = static_cast<uint64_t>(getSizeX()) *
-    static_cast<uint64_t>(getSizeY()) *
-    static_cast<uint64_t>(getSizeDim3());
+                              static_cast<uint64_t>(getSizeY()) *
+                              static_cast<uint64_t>(getSizeDim3());
   NodeGetter neighborGetter =
     [&, this](const uint64_t & index, NodePtr & neighbor_rtn) -> bool
     {
@@ -373,81 +374,91 @@ bool AStarAlgorithm<NodeT>::createPath(
       return true;
     };
 
+  //下面是一个大的while循环！！！！！
   while (iterations < getMaxIterations() && !_queue.empty()) {
-    // Check for planning timeout and cancel only on every Nth iteration
-    if (iterations % _terminal_checking_interval == 0) {
-      if (cancel_checker()) {
-        throw nav2_core::PlannerCancelled("Planner was cancelled");
+      // Check for planning timeout and cancel only on every Nth iteration
+      if (iterations % _terminal_checking_interval == 0) {
+        if (cancel_checker()) {
+          throw nav2_core::PlannerCancelled("Planner was cancelled");
+        }
+        std::chrono::duration<double> planning_duration =
+          std::chrono::duration_cast<std::chrono::duration<double>>(steady_clock::now() - start_time);
+        if (static_cast<double>(planning_duration.count()) >= _max_planning_time) {
+          return false;
+        }
       }
-      std::chrono::duration<double> planning_duration =
-        std::chrono::duration_cast<std::chrono::duration<double>>(steady_clock::now() - start_time);
-      if (static_cast<double>(planning_duration.count()) >= _max_planning_time) {
-        return false;
+
+      // 1) Pick Nbest from O s.t. min(f(Nbest)), remove from queue
+      current_node = getNextNode();//如果你要是用hybrid A*,这个就对应node_hybrid.cpp定义的类
+
+      // Save current node coordinates for debug
+      if (expansions_log) {
+        populateExpansionsLog(current_node, expansions_log);
       }
-    }
 
-    // 1) Pick Nbest from O s.t. min(f(Nbest)), remove from queue
-    current_node = getNextNode();
-
-    // Save current node coordinates for debug
-    if (expansions_log) {
-      populateExpansionsLog(current_node, expansions_log);
-    }
-
-    // We allow for nodes to be queued multiple times in case
-    // shorter paths result in it, but we can visit only once
-    // Also a chance to perform last-checks necessary.
-    if (onVisitationCheckNode(current_node)) {
-      continue;
-    }
-
-    iterations++;
-
-    // 2) Mark Nbest as visited
-    current_node->visited();
-
-    // 2.1) Use an analytic expansion (if available) to generate a path
-    expansion_result = nullptr;
-    expansion_result = _expander->tryAnalyticExpansion(
-      current_node, coarse_check_goals, fine_check_goals,
-      _goal_manager.getGoalsCoordinates(), neighborGetter, analytic_iterations, closest_distance);
-    if (expansion_result != nullptr) {
-      current_node = expansion_result;
-    }
-
-    // 3) Check if we're at the goal, backtrace if required
-    if (_goal_manager.isGoal(current_node)) {
-      return current_node->backtracePath(path);
-    } else if (_best_heuristic_node.first < getToleranceHeuristic()) {
-      // Optimization: Let us find when in tolerance and refine within reason
-      approach_iterations++;
-      if (approach_iterations >= getOnApproachMaxIterations()) {
-        return _graph.at(_best_heuristic_node.second).backtracePath(path);
+      // We allow for nodes to be queued multiple times in case
+      // shorter paths result in it, but we can visit only once
+      // Also a chance to perform last-checks necessary.
+      if (onVisitationCheckNode(current_node)) {
+        continue;
       }
-    }
 
-    // 4) Expand neighbors of Nbest not visited
-    neighbors.clear();
-    current_node->getNeighbors(neighborGetter, _collision_checker, _traverse_unknown, neighbors);
+      iterations++;
 
-    for (neighbor_iterator = neighbors.begin();
-      neighbor_iterator != neighbors.end(); ++neighbor_iterator)
-    {
-      neighbor = *neighbor_iterator;
+      // 2) Mark Nbest as visited
+      current_node->visited();
 
-      // 4.1) Compute the cost to go to this node
-      g_cost = current_node->getAccumulatedCost() + current_node->getTraversalCost(neighbor);
-
-      // 4.2) If this is a lower cost than prior, we set this as the new cost and new approach
-      if (g_cost < neighbor->getAccumulatedCost()) {
-        neighbor->setAccumulatedCost(g_cost);
-        neighbor->parent = current_node;
-
-        // 4.3) Add to queue with heuristic cost
-        addNode(g_cost + getHeuristicCost(neighbor), neighbor);
+      // 2.1) Use an analytic expansion (if available) to generate a path
+      //expansion_result的数据类型是NodePtr
+      expansion_result = nullptr;
+      //std::unique_ptr<AnalyticExpansion<NodeT>> _expander;
+      // 该函数的主要作用是尝试从当前节点current_node直接通过解析扩展（如Reeds-Shepp或Dubins曲线）连接到目标点，提高A*搜索效率，若成功则返回一条可行路径的终止节点，否则返回nullptr。
+      expansion_result = _expander->tryAnalyticExpansion(
+        current_node, // current_node：当前A*搜索扩展到的节点。
+        coarse_check_goals, // coarse_check_goals：用于粗略解析扩展的目标节点集合（通常分辨率较低，先做快速可行性判断）。
+        fine_check_goals,// fine_check_goals：用于精细解析扩展的目标节点集合（分辨率高，做最终可行性验证）。
+        _goal_manager.getGoalsCoordinates(), // _goal_manager.getGoalsCoordinates()：所有目标点的坐标集合，用于解析扩展的终止判定。
+        neighborGetter, // neighborGetter：用于获取指定索引节点的函数对象，保证节点有效性和可用性。
+        analytic_iterations, // analytic_iterations：记录解析扩展尝试的次数。
+        closest_distance);// closest_distance：记录当前解析扩展过程中距离目标最近的距离，用于后续优化。
+      
+        if (expansion_result != nullptr) {
+        current_node = expansion_result;
       }
-    }
-  }
+
+      // 3) Check if we're at the goal, backtrace if required
+      if (_goal_manager.isGoal(current_node)) {
+        return current_node->backtracePath(path);
+      } else if (_best_heuristic_node.first < getToleranceHeuristic()) {
+        // Optimization: Let us find when in tolerance and refine within reason
+        approach_iterations++;
+        if (approach_iterations >= getOnApproachMaxIterations()) {
+          return _graph.at(_best_heuristic_node.second).backtracePath(path);
+        }
+      }
+
+      // 4) Expand neighbors of Nbest not visited
+      neighbors.clear();
+      current_node->getNeighbors(neighborGetter, _collision_checker, _traverse_unknown, neighbors);
+
+      for (neighbor_iterator = neighbors.begin();
+        neighbor_iterator != neighbors.end(); ++neighbor_iterator)
+      {
+        neighbor = *neighbor_iterator;
+
+        // 4.1) Compute the cost to go to this node
+        g_cost = current_node->getAccumulatedCost() + current_node->getTraversalCost(neighbor);
+
+        // 4.2) If this is a lower cost than prior, we set this as the new cost and new approach
+        if (g_cost < neighbor->getAccumulatedCost()) {
+          neighbor->setAccumulatedCost(g_cost);
+          neighbor->parent = current_node;
+
+          // 4.3) Add to queue with heuristic cost
+          addNode(g_cost + getHeuristicCost(neighbor), neighbor);
+        }
+      }
+  }//while循环结束！！！！！！
 
   if (_best_heuristic_node.first < getToleranceHeuristic()) {
     // If we run out of search options, return the path that is closest, if within tolerance.

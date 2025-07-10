@@ -47,7 +47,7 @@ template<typename NodeT>
 class AStarAlgorithm
 {
 public:
-  typedef NodeT * NodePtr;
+  typedef NodeT * NodePtr;//如果你要使用hybrid A*算法，那么这个就对应node_hybrid.cpp定义的类
   typedef robin_hood::unordered_node_map<uint64_t, NodeT> Graph;
   typedef std::vector<NodePtr> NodeVector;
   typedef std::pair<float, NodeBasic<NodeT>> NodeElement;

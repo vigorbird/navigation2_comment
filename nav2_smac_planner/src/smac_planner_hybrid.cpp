@@ -56,8 +56,10 @@ void SmacPlannerHybrid::configure(
   auto node = parent.lock();
   _logger = node->get_logger();
   _clock = node->get_clock();
+  //1.获取costmap
   _costmap = costmap_ros->getCostmap();
   _costmap_ros = costmap_ros;
+
   _name = name;
   _global_frame = costmap_ros->getGlobalFrameID();
 
@@ -66,7 +68,8 @@ void SmacPlannerHybrid::configure(
   int angle_quantizations;
   double analytic_expansion_max_length_m;
   bool smooth_path;
-
+  
+  //2.根据输入的name，设置一些参数
   // General planner params
   nav2::declare_parameter_if_not_declared(
     node, name + ".downsample_costmap", rclcpp::ParameterValue(false));
@@ -254,15 +257,28 @@ void SmacPlannerHybrid::configure(
     _lookup_table_dim += 1.0;
   }
 
+  //3.初始化collision_checker
   // Initialize collision checker
   _collision_checker = GridCollisionChecker(_costmap_ros, _angle_quantizations, node);
   _collision_checker.setFootprint(
-    _costmap_ros->getRobotFootprint(),
-    _costmap_ros->getUseRadius(),
-    findCircumscribedCost(_costmap_ros));
+    _costmap_ros->getRobotFootprint(),//机器人的实际足迹点集，通常是一个多边形的顶点序列，描述机器人在地图上的二维外形。矩形机器人就用4个点，圆形机器人可以用近似多边形。
+    _costmap_ros->getUseRadius(),//是否只用半径（圆形近似）来做碰撞检测。true,只用半径（更快，但不精确，适合圆形机器人）。false,用多边形（更精确，但更慢，适合矩形机器人）。
+    findCircumscribedCost(_costmap_ros));//计算机器人外接圆的半径，用于碰撞检测。
 
+  //4.初始化A*模板类
   // Initialize A* template
+  //AStarAlgorithm这个类是来自于文件a_star.cpp
+  // _motion_model 包含了用于A*搜索的运动学模型类型（如Dubins、Reeds-Shepp、Omni等），决定了路径搜索时允许的运动方式和约束。
+  // _search_info 是一个结构体，包含了路径搜索相关的参数配置，如最小转弯半径、各种惩罚系数（倒车、转向、非直线、代价等）、是否允许插值、是否缓存启发式、解析扩展相关参数等。
   _a_star = std::make_unique<AStarAlgorithm<NodeHybrid>>(_motion_model, _search_info);
+  // 该函数用于初始化A*算法对象，各参数含义如下：
+  // _allow_unknown: 是否允许在未知区域（如未探索区域）内进行路径搜索
+  // _max_iterations: A*搜索的最大迭代次数，防止陷入死循环
+  // _max_on_approach_iterations: 接近目标点时的最大迭代次数，细化终点附近的搜索
+  // _terminal_checking_interval: 终止条件检查的间隔（迭代次数），用于定期判断是否满足终止条件
+  // _max_planning_time: 路径规划的最大允许时间（秒），超时则终止搜索
+  // _lookup_table_dim: 启发式查找表的维度（网格大小），用于加速启发式计算
+  // _angle_quantizations: 角度离散化的数量，将360度分成多少份，影响运动方向的分辨率
   _a_star->initialize(
     _allow_unknown,
     _max_iterations,
@@ -272,17 +288,26 @@ void SmacPlannerHybrid::configure(
     _lookup_table_dim,
     _angle_quantizations);
 
+  //5.初始化路径平滑器
   // Initialize path smoother
   if (smooth_path) {
     SmootherParams params;
     params.get(node, name);
-    _smoother = std::make_unique<Smoother>(params);
+    _smoother = std::make_unique<Smoother>(params);//std::unique_ptr<Smoother> _smoother,这个成员变量就在smac_planner_hybrid.hpp这个文件中
     _smoother->initialize(_minimum_turning_radius_global_coords);
   }
 
+  //6.初始化代价地图下采样器
   // Initialize costmap downsampler
   _costmap_downsampler = std::make_unique<CostmapDownsampler>();
   std::string topic_name = "downsampled_costmap";
+  // 该函数的作用：初始化并配置代价地图下采样器（CostmapDownsampler），用于将原始代价地图按照指定的下采样因子进行降采样处理，从而加快后续路径规划的速度，降低计算量。
+  // 输入参数含义如下：
+  // node：当前ROS节点指针，用于参数获取、话题发布等
+  // _global_frame：全局坐标系名称，通常为"map"
+  // topic_name：下采样后代价地图发布的话题名
+  // _costmap：原始代价地图指针
+  // _downsampling_factor：下采样因子，决定降采样的比例（如2表示每2个像素合并为1个）
   _costmap_downsampler->on_configure(
     node, _global_frame, topic_name, _costmap, _downsampling_factor);
 
@@ -387,27 +412,33 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
 
   std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(_costmap->getMutex()));
 
+  //1.对代价地图进行下采样，并更新costmap
   // Downsample costmap, if required
   nav2_costmap_2d::Costmap2D * costmap = _costmap;
   if (_downsample_costmap && _downsampling_factor > 1) {
     costmap = _costmap_downsampler->downsample(_downsampling_factor);
     _collision_checker.setCostmap(costmap);
   }
-
+  
+  //2.设置collision的参数
   // Set collision checker and costmap information
   _collision_checker.setFootprint(
     _costmap_ros->getRobotFootprint(),
     _costmap_ros->getUseRadius(),
     findCircumscribedCost(_costmap_ros));
+
+  //3.向a_star中更新collision checker
   _a_star->setCollisionChecker(&_collision_checker);
 
   // Set starting point, in A* bin search coordinates
+  //4.根据初始和结束的位置和姿态，将其变换到栅格坐标系，并设置到a_star的起点和终点
   float mx_start, my_start, mx_goal, my_goal;
+  //根据世界坐标系下的xy坐标，转换到栅格地图坐标
   if (!costmap->worldToMapContinuous(
-    start.pose.position.x,
-    start.pose.position.y,
-    mx_start,
-    my_start))
+    start.pose.position.x,//input
+    start.pose.position.y,//input
+    mx_start,//ouput
+    my_start))//output
   {
     throw nav2_core::StartOutsideMapBounds(
             "Start Coordinates of(" + std::to_string(start.pose.position.x) + ", " +
@@ -422,6 +453,7 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
   if (orientation_bin >= static_cast<float>(_angle_quantizations)) {
     orientation_bin -= static_cast<float>(_angle_quantizations);
   }
+  //设置a_star的起点grid坐标！！！！！！！！！！！！！
   _a_star->setStart(mx_start, my_start, static_cast<unsigned int>(orientation_bin));
 
   // Set goal point, in A* bin search coordinates
@@ -443,11 +475,12 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
   if (orientation_bin >= static_cast<float>(_angle_quantizations)) {
     orientation_bin -= static_cast<float>(_angle_quantizations);
   }
+   //设置a_star的终点grid坐标！！！！！！！！！！！！！
   _a_star->setGoal(mx_goal, my_goal, static_cast<unsigned int>(orientation_bin),
-    _goal_heading_mode, _coarse_search_resolution);
+                  _goal_heading_mode, _coarse_search_resolution);
 
   // Setup message
-  nav_msgs::msg::Path plan;
+  nav_msgs::msg::Path plan;//这是我们想要的轨迹！！！
   plan.header.stamp = _clock->now();
   plan.header.frame_id = _global_frame;
   geometry_msgs::msg::PoseStamped pose;
@@ -478,14 +511,19 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
   NodeHybrid::CoordinateVector path;
   int num_iterations = 0;
   std::string error;
+  // expansions 这个变量用于在调试可视化模式下，记录A*算法在搜索过程中扩展过的所有节点的位置信息（三元组：x, y, theta）。
+  // 这样可以在调试时将A*的搜索过程（扩展过的节点）以PoseArray的形式发布出来，方便在RViz等工具中可视化分析A*的搜索轨迹和扩展范围。
   std::unique_ptr<std::vector<std::tuple<float, float, float>>> expansions = nullptr;
   if (_debug_visualizations) {
     expansions = std::make_unique<std::vector<std::tuple<float, float, float>>>();
   }
   // Note: All exceptions thrown are handled by the planner server and returned to the action
+  //5.核心算法！！！！！！！
   if (!_a_star->createPath(
       path, num_iterations,
-      _tolerance / static_cast<float>(costmap->getResolution()), cancel_checker, expansions.get()))
+      _tolerance / static_cast<float>(costmap->getResolution()), 
+      cancel_checker, 
+      expansions.get()))
   {
     if (_debug_visualizations) {
       geometry_msgs::msg::PoseArray msg;
@@ -514,9 +552,10 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
   }
 
   // Convert to world coordinates
-  plan.poses.reserve(path.size());
+  //进行数据格式转化！！！！
+  plan.poses.reserve(path.size());    
   for (int i = path.size() - 1; i >= 0; --i) {
-    pose.pose = getWorldCoords(path[i].x, path[i].y, costmap);
+    pose.pose = getWorldCoords(path[i].x, path[i].y, costmap);//将grid地图变换到世界坐标系下，origin_x + path[i].x * resolution;
     pose.pose.orientation = getWorldOrientation(path[i].theta);
     plan.poses.push_back(pose);
   }
@@ -571,6 +610,7 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
 #endif
 
   // Smooth plan
+  //6.平滑轨迹！！！！！！！！！非常重要的函数！！！！！
   if (_smoother && num_iterations > 1) {
     _smoother->smooth(plan, costmap, time_remaining);
   }
