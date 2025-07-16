@@ -22,6 +22,7 @@ void NodeBasic<Node2D>::processSearchNode()
 {
 }
 
+//
 template<>
 void NodeBasic<NodeHybrid>::processSearchNode()
 {

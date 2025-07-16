@@ -96,6 +96,8 @@ inline GoalHeadingMode fromStringToGH(const std::string & n)
 
 const float UNKNOWN_COST = 255.0;
 const float OCCUPIED_COST = 254.0;
+// INSCRIBED_COST 表示“内切障碍物代价”，即机器人足迹刚好与障碍物内切时的代价值，常用于路径规划中判断机器人是否处于安全边界上。
+// 该值通常比 OCCUPIED_COST（占用/碰撞代价254）略低，表示虽然未碰撞但已非常接近障碍物，属于高风险区域。
 const float INSCRIBED_COST = 253.0;
 const float MAX_NON_OBSTACLE_COST = 252.0;
 const float FREE_COST = 0;

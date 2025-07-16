@@ -97,10 +97,14 @@ public:
    * @param fine_check_goals Output list of goals for fine search refinement.
    * @param coarse_search_resolution Number of fine goals per coarse goal.
    */
-  void prepareGoalsForAnalyticExpansion(
-    NodeVector & coarse_check_goals, NodeVector & fine_check_goals,
-    int coarse_search_resolution)
+  void prepareGoalsForAnalyticExpansion(NodeVector & coarse_check_goals, 
+                                        NodeVector & fine_check_goals,
+                                        int coarse_search_resolution)
   {
+    //如果你只有一个目标，那么这个目标一定是粗目标点
+    //在 Hybrid A* 或 Lattice 路径规划算法中，通常会有多个目标点_goals_state（比如终点有一定容忍区间或多目标任务）。
+    //将所有有效的目标点，按照指定的分辨率分为“粗粒度目标”和“细粒度目标”，以便在分析性扩展（如Hybrid A的直接连线尝试）时，
+    //先对粗粒度目标做快速尝试，再对细粒度目标做补充优化，从而提升路径规划的效率和成功率。
     for (unsigned int i = 0; i < _goals_state.size(); i++) {
       if (_goals_state[i].is_valid) {
         if (i % coarse_search_resolution == 0) {
@@ -110,7 +114,7 @@ public:
         }
       }
     }
-  }
+  }//end function prepareGoalsForAnalyticExpansion
 
   /**
    * @brief Filters and marks invalid goals based on collision checking and tolerance thresholds.

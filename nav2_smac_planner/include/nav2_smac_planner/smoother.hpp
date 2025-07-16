@@ -62,9 +62,9 @@ struct BoundaryPoints
 struct BoundaryExpansion
 {
   double path_end_idx{0.0};
-  double expansion_path_length{0.0};
-  double original_path_length{0.0};
-  std::vector<BoundaryPoints> pts;
+  double expansion_path_length{0.0};//存储的是经过插值之后的原点到这个expansion节点的累计距离
+  double original_path_length{0.0};//存储的是原始起点到这个expansion节点的累计距离
+  std::vector<BoundaryPoints> pts;//这个expansion节点，又重新插值的点的坐标
   bool in_collision{false};
 };
 
@@ -227,7 +227,7 @@ protected:
   int max_its_, refinement_ctr_, refinement_num_;
   bool is_holonomic_, do_refinement_;
   MotionModel motion_model_;
-  ompl::base::StateSpacePtr state_space_;
+  ompl::base::StateSpacePtr state_space_;//原始的nv2代码中，state_space_使用的是dubins曲线
 };
 
 }  // namespace nav2_smac_planner

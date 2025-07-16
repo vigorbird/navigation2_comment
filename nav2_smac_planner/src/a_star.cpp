@@ -116,11 +116,12 @@ void AStarAlgorithm<NodeT>::setCollisionChecker(GridCollisionChecker * collision
   if (getSizeX() != x_size || getSizeY() != y_size) {
     _x_size = x_size;
     _y_size = y_size;
-    NodeT::initMotionModel(_motion_model, _x_size, _y_size, _dim3_size, _search_info);
+    NodeT::initMotionModel(_motion_model, _x_size, _y_size, _dim3_size, _search_info);//非常重要的函数！！！!!!
   }
   _expander->setCollisionChecker(_collision_checker);
 }
 
+//
 template<typename NodeT>
 typename AStarAlgorithm<NodeT>::NodePtr AStarAlgorithm<NodeT>::addToGraph(
   const uint64_t & index)
@@ -232,8 +233,9 @@ void AStarAlgorithm<NodeT>::setGoal(
       throw std::runtime_error("Start must be set before goal.");
     }
 
+    //整个代码就这里使用了resetObstacleHeuristic函数
     NodeT::resetObstacleHeuristic(
-      _collision_checker->getCostmapROS(), _start->pose.x, _start->pose.y, mx, my);
+      _collision_checker->getCostmapROS(), _start->pose.x, _start->pose.y, mx, my);//mx 和 my是目标点！！！！
   }
 
   _goal_manager.setRefGoalCoordinates(ref_goal_coord);
@@ -296,7 +298,9 @@ void AStarAlgorithm<NodeT>::setGoal(
     case GoalHeadingMode::UNKNOWN:
       throw std::runtime_error("Goal heading is UNKNOWN.");
   }
-}
+}//end function setGoal!!!!
+
+
 
 template<typename NodeT>
 bool AStarAlgorithm<NodeT>::areInputsValid()
@@ -330,23 +334,31 @@ bool AStarAlgorithm<NodeT>::createPath(
   std::function<bool()> cancel_checker,
   std::vector<std::tuple<float, float, float>> * expansions_log)
 {
+
   steady_clock::time_point start_time = steady_clock::now();
   _tolerance = tolerance;
-  _best_heuristic_node = {std::numeric_limits<float>::max(), 0};
+  _best_heuristic_node = {std::numeric_limits<float>::max(), 0};//是一个pair，存储是float 和 index
+  //1.清空优先队列！！
   clearQueue();
 
   if (!areInputsValid()) {
     return false;
   }
 
+  //2.设置粗细目标点
+  //如果你只有一个目标，那么这个目标一定是粗目标点
+  //在 Hybrid A* 或 Lattice 路径规划算法中，通常会有多个目标点_goals_state（比如终点有一定容忍区间或多目标任务）。
+  //将所有有效的目标点，按照指定的分辨率分为“粗粒度目标”和“细粒度目标”，以便在分析性扩展（如Hybrid A的直接连线尝试）时，
+  //先对粗粒度目标做快速尝试，再对细粒度目标做补充优化，从而提升路径规划的效率和成功率。
   NodeVector coarse_check_goals, fine_check_goals;
-  _goal_manager.prepareGoalsForAnalyticExpansion(coarse_check_goals, 
-                                                  fine_check_goals,
-                                                  _coarse_search_resolution);
+  _goal_manager.prepareGoalsForAnalyticExpansion(coarse_check_goals, //输出变量
+                                                  fine_check_goals,//输出变量
+                                                _coarse_search_resolution);//输入变量
 
   // 0) Add starting point to the open set
-  addNode(0.0, getStart());
-  getStart()->setAccumulatedCost(0.0);
+  //3.向优先队列中添加当前起始点
+  addNode(0.0, getStart());//getStart返回的数据类型是NodePtr
+  getStart()->setAccumulatedCost(0.0);//设置这个node的成员变量值 _accumulated_cost
 
   // Optimization: preallocate all variables
   NodePtr current_node = nullptr;
@@ -361,8 +373,10 @@ bool AStarAlgorithm<NodeT>::createPath(
 
   // Given an index, return a node ptr reference if its collision-free and valid
   const uint64_t max_index = static_cast<uint64_t>(getSizeX()) *
-                              static_cast<uint64_t>(getSizeY()) *
-                              static_cast<uint64_t>(getSizeDim3());
+    static_cast<uint64_t>(getSizeY()) *
+    static_cast<uint64_t>(getSizeDim3());
+    
+    //定义了一个lambada函数，新建index这个节点并向graph添加
   NodeGetter neighborGetter =
     [&, this](const uint64_t & index, NodePtr & neighbor_rtn) -> bool
     {
@@ -370,97 +384,104 @@ bool AStarAlgorithm<NodeT>::createPath(
         return false;
       }
 
-      neighbor_rtn = addToGraph(index);
+      neighbor_rtn = addToGraph(index);//新建index这个节点并向graph添加，graph本质上就是一个哈希表
       return true;
     };
 
-  //下面是一个大的while循环！！！！！
+
+  //开始了最大的while循环！！！！！！！！！！！！！！！！！！1
   while (iterations < getMaxIterations() && !_queue.empty()) {
+        
       // Check for planning timeout and cancel only on every Nth iteration
-      if (iterations % _terminal_checking_interval == 0) {
-        if (cancel_checker()) {
-          throw nav2_core::PlannerCancelled("Planner was cancelled");
+        if (iterations % _terminal_checking_interval == 0) {
+          if (cancel_checker()) {
+            throw nav2_core::PlannerCancelled("Planner was cancelled");
+          }
+          std::chrono::duration<double> planning_duration = std::chrono::duration_cast<std::chrono::duration<double>>(steady_clock::now() - start_time);
+          if (static_cast<double>(planning_duration.count()) >= _max_planning_time) {
+            return false;
+          }
         }
-        std::chrono::duration<double> planning_duration =
-          std::chrono::duration_cast<std::chrono::duration<double>>(steady_clock::now() - start_time);
-        if (static_cast<double>(planning_duration.count()) >= _max_planning_time) {
-          return false;
+
+        // 1) Pick Nbest from O s.t. min(f(Nbest)), remove from queue
+        //4.1从优先队列中取出node，然后将这个node从优先队列中pop出去。
+        current_node = getNextNode();
+
+        // Save current node coordinates for debug
+        if (expansions_log) {
+          populateExpansionsLog(current_node, expansions_log);
         }
-      }
 
-      // 1) Pick Nbest from O s.t. min(f(Nbest)), remove from queue
-      current_node = getNextNode();//如果你要是用hybrid A*,这个就对应node_hybrid.cpp定义的类
+        // We allow for nodes to be queued multiple times in case
+        // shorter paths result in it, but we can visit only once
+        // Also a chance to perform last-checks necessary.
+        //4.2 判断这个node是否被访问过，如果被访问过了则直接contine
+        if (onVisitationCheckNode(current_node)) {
+          continue;
+        }
 
-      // Save current node coordinates for debug
-      if (expansions_log) {
-        populateExpansionsLog(current_node, expansions_log);
-      }
+        iterations++;
 
-      // We allow for nodes to be queued multiple times in case
-      // shorter paths result in it, but we can visit only once
-      // Also a chance to perform last-checks necessary.
-      if (onVisitationCheckNode(current_node)) {
-        continue;
-      }
+        // 2) Mark Nbest as visited
+        //4.3 设置这个node被访问过了
+        current_node->visited();//设置这个node被访问过了
 
-      iterations++;
-
-      // 2) Mark Nbest as visited
-      current_node->visited();
-
-      // 2.1) Use an analytic expansion (if available) to generate a path
-      //expansion_result的数据类型是NodePtr
-      expansion_result = nullptr;
-      //std::unique_ptr<AnalyticExpansion<NodeT>> _expander;
-      // 该函数的主要作用是尝试从当前节点current_node直接通过解析扩展（如Reeds-Shepp或Dubins曲线）连接到目标点，提高A*搜索效率，若成功则返回一条可行路径的终止节点，否则返回nullptr。
-      expansion_result = _expander->tryAnalyticExpansion(
-        current_node, // current_node：当前A*搜索扩展到的节点。
-        coarse_check_goals, // coarse_check_goals：用于粗略解析扩展的目标节点集合（通常分辨率较低，先做快速可行性判断）。
-        fine_check_goals,// fine_check_goals：用于精细解析扩展的目标节点集合（分辨率高，做最终可行性验证）。
-        _goal_manager.getGoalsCoordinates(), // _goal_manager.getGoalsCoordinates()：所有目标点的坐标集合，用于解析扩展的终止判定。
-        neighborGetter, // neighborGetter：用于获取指定索引节点的函数对象，保证节点有效性和可用性。
-        analytic_iterations, // analytic_iterations：记录解析扩展尝试的次数。
-        closest_distance);// closest_distance：记录当前解析扩展过程中距离目标最近的距离，用于后续优化。
-      
+        // 2.1) Use an analytic expansion (if available) to generate a path
+        //4.4 
+        expansion_result = nullptr;
+        expansion_result = _expander->tryAnalyticExpansion( current_node, 
+                                                            coarse_check_goals, //两种不同的目标，如果只有一个目标，那么coarse只有一个元素，fine_check_goals没有元素
+                                                            fine_check_goals,
+                                                            _goal_manager.getGoalsCoordinates(), //终点的坐标，如果是hybrid A*，那么就是xy和theta。
+                                                            neighborGetter, //向graph添加节点的函数
+                                                            analytic_iterations, 
+                                                            closest_distance);//这是一个输出变量会被更新！！
         if (expansion_result != nullptr) {
-        current_node = expansion_result;
-      }
-
-      // 3) Check if we're at the goal, backtrace if required
-      if (_goal_manager.isGoal(current_node)) {
-        return current_node->backtracePath(path);
-      } else if (_best_heuristic_node.first < getToleranceHeuristic()) {
-        // Optimization: Let us find when in tolerance and refine within reason
-        approach_iterations++;
-        if (approach_iterations >= getOnApproachMaxIterations()) {
-          return _graph.at(_best_heuristic_node.second).backtracePath(path);
+          current_node = expansion_result;
         }
-      }
 
-      // 4) Expand neighbors of Nbest not visited
-      neighbors.clear();
-      //这里要注意_collision_checker在这里被调用了！！！！！！！！
-      current_node->getNeighbors(neighborGetter, _collision_checker, _traverse_unknown, neighbors);
-
-      for (neighbor_iterator = neighbors.begin();
-        neighbor_iterator != neighbors.end(); ++neighbor_iterator)
-      {
-        neighbor = *neighbor_iterator;
-
-        // 4.1) Compute the cost to go to this node
-        g_cost = current_node->getAccumulatedCost() + current_node->getTraversalCost(neighbor);
-
-        // 4.2) If this is a lower cost than prior, we set this as the new cost and new approach
-        if (g_cost < neighbor->getAccumulatedCost()) {
-          neighbor->setAccumulatedCost(g_cost);
-          neighbor->parent = current_node;
-
-          // 4.3) Add to queue with heuristic cost
-          addNode(g_cost + getHeuristicCost(neighbor), neighbor);
+        // 3) Check if we're at the goal, backtrace if required
+        if (_goal_manager.isGoal(current_node)) {//表示已经到达了终点
+          return current_node->backtracePath(path);//遍历之前的所有path，取出最优路径
+        } else if (_best_heuristic_node.first < getToleranceHeuristic()) {//getToleranceHeuristic返回的是tolerance值
+          // Optimization: Let us find when in tolerance and refine within reason
+          approach_iterations++;
+          if (approach_iterations >= getOnApproachMaxIterations()) {//迭代次数太多，也是需要直接返回的!!!!
+            return _graph.at(_best_heuristic_node.second).backtracePath(path);
+          }
         }
-      }
-  }//while循环结束！！！！！！
 
+        // 4) Expand neighbors of Nbest not visited
+        //4.7 清空neighbour，并且根据当前节点获取新的neighbour
+        neighbors.clear();
+        //
+        // 这个函数的作用是获取当前节点 current_node 的所有可行邻居节点，并将它们存入 neighbors 向量中。
+        // neighborGetter 用于根据索引获取邻居节点指针，_collision_checker 用于碰撞检测，
+        // _traverse_unknown 表示是否允许遍历未知区域。
+        current_node->getNeighbors(neighborGetter, _collision_checker, _traverse_unknown, neighbors);
+
+        for (neighbor_iterator = neighbors.begin();
+          neighbor_iterator != neighbors.end(); ++neighbor_iterator)
+        {
+          neighbor = *neighbor_iterator;
+
+          // 4.1) Compute the cost to go to this node
+          //a.走到这个neighbour所耗费的cost
+          g_cost = current_node->getAccumulatedCost() + current_node->getTraversalCost(neighbor);//!!!!!
+
+          // 4.2) If this is a lower cost than prior, we set this as the new cost and new approach
+          if (g_cost < neighbor->getAccumulatedCost()) {
+            neighbor->setAccumulatedCost(g_cost);
+            neighbor->parent = current_node;
+
+            // 4.3) Add to queue with heuristic cost
+            addNode(g_cost + getHeuristicCost(neighbor), neighbor);
+          }
+        }
+  }//结束了while循环！！！！
+
+  // std::pair<float, uint64_t> _best_heuristic_node;
+  //5.
   if (_best_heuristic_node.first < getToleranceHeuristic()) {
     // If we run out of search options, return the path that is closest, if within tolerance.
     return _graph.at(_best_heuristic_node.second).backtracePath(path);
@@ -475,12 +496,15 @@ typename AStarAlgorithm<NodeT>::NodePtr & AStarAlgorithm<NodeT>::getStart()
   return _start;
 }
 
+//从优先队列中最顶层取出 node，然后将这个node从优先队列中pop出去
+//然后更新这个node的信息
+//最后将这个node返回
 template<typename NodeT>
 typename AStarAlgorithm<NodeT>::NodePtr AStarAlgorithm<NodeT>::getNextNode()
 {
   NodeBasic<NodeT> node = _queue.top().second;
   _queue.pop();
-  node.processSearchNode();
+  node.processSearchNode();//如果这个node没有被访问过，则更新这个node的信息
   return node.graph_node_ptr;
 }
 
@@ -488,18 +512,17 @@ template<typename NodeT>
 void AStarAlgorithm<NodeT>::addNode(const float & cost, NodePtr & node)
 {
   NodeBasic<NodeT> queued_node(node->getIndex());
-  queued_node.populateSearchNode(node);
-  _queue.emplace(cost, queued_node);
+  queued_node.populateSearchNode(node);//使用node中存储的信息，更新queued_node的成语对象
+  _queue.emplace(cost, queued_node);//构建一个node，向优先队列中压入！！！！
 }
 
 template<typename NodeT>
 float AStarAlgorithm<NodeT>::getHeuristicCost(const NodePtr & node)
 {
-  const Coordinates node_coords =
-    NodeT::getCoords(node->getIndex(), getSizeX(), getSizeDim3());
+  const Coordinates node_coords = NodeT::getCoords(node->getIndex(), getSizeX(), getSizeDim3());
   float heuristic = NodeT::getHeuristicCost(node_coords, _goal_manager.getGoalsCoordinates());
   if (heuristic < _best_heuristic_node.first) {
-    _best_heuristic_node = {heuristic, node->getIndex()};
+    _best_heuristic_node = {heuristic, node->getIndex()};//整个代码就这里更新了_best_heuristic_node
   }
 
   return heuristic;

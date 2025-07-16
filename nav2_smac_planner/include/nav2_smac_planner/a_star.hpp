@@ -47,7 +47,7 @@ template<typename NodeT>
 class AStarAlgorithm
 {
 public:
-  typedef NodeT * NodePtr;//如果你要使用hybrid A*算法，那么这个就对应node_hybrid.cpp定义的类
+  typedef NodeT * NodePtr;
   typedef robin_hood::unordered_node_map<uint64_t, NodeT> Graph;
   typedef std::vector<NodePtr> NodeVector;
   typedef std::pair<float, NodeBasic<NodeT>> NodeElement;
@@ -278,7 +278,7 @@ protected:
 
   NodePtr _start;
   GoalManagerT _goal_manager;
-  Graph _graph;
+  Graph _graph;//是个哈希表数据类型，value存储的就是node实体
   NodeQueue _queue;
 
   MotionModel _motion_model;

@@ -116,12 +116,12 @@ struct HybridMotionTable
   double getAngle(const double & theta);
 
   MotionModel motion_model = MotionModel::UNKNOWN;
-  MotionPoses projections;
+  MotionPoses projections;//std::vector<MotionPose>,MotionPose中包括了xy theta和转向方向
   unsigned int size_x;
   unsigned int num_angle_quantization;
   float num_angle_quantization_float;
   float min_turning_radius;
-  float bin_size;
+  float bin_size;//一个bin对应多大的角度
   float change_penalty;
   float non_straight_penalty;
   float cost_penalty;
@@ -130,10 +130,10 @@ struct HybridMotionTable
   bool downsample_obstacle_heuristic;
   bool use_quadratic_cost_penalty;
   ompl::base::StateSpacePtr state_space;
-  std::vector<std::vector<double>> delta_xs;
-  std::vector<std::vector<double>> delta_ys;
-  std::vector<TrigValues> trig_values;
-  std::vector<float> travel_costs;
+  std::vector<std::vector<double>> delta_xs;//全局坐标系下的projection对用的x位移，第一个序号表示哪个projection，第二个序号表示对应哪个角度
+  std::vector<std::vector<double>> delta_ys;//全局坐标系下的projection对用的y位移，第一个序号表示哪个projection，第二个序号表示对应哪个角度
+  std::vector<TrigValues> trig_values;//和角度的离散化数量相关
+  std::vector<float> travel_costs;//数量和projection的数量相同，每个projection走过的弧长
 };
 
 /**
@@ -250,6 +250,7 @@ public:
    * @brief Gets the motion primitive index used to achieve node in search
    * @return reference to motion primitive idx
    */
+  //这个函数本质上是返回的projection的序号！！！！！
   inline unsigned int & getMotionPrimitiveIndex()
   {
     return _motion_primitive_index;
@@ -357,14 +358,23 @@ public:
    * @param angle_quantization Theta size of costmap
    * @return Coordinates
    */
+  // 根据index计算得到angle、x和y
   static inline Coordinates getCoords(
     const uint64_t & index,
     const unsigned int & width, const unsigned int & angle_quantization)
   {
+    // 这个公式的计算方式是为了将一维的索引 index 映射回三维的坐标 (x, y, theta)。
+    // 在 getIndex 的实现中，三维坐标 (x, y, angle) 被编码为一维索引：
+    // index = angle + x * angle_quantization + y * width * angle_quantization
+    // 反过来解码时：
+    // - theta（角度索引）是 index % angle_quantization
+    // - x 是 (index / angle_quantization) % width
+    // - y 是 index / (angle_quantization * width)
+    // 这样可以保证一一对应，且高效地在一维数组和三维坐标之间转换。
     return Coordinates(
-      (index / angle_quantization) % width,    // x
-      index / (angle_quantization * width),    // y
-      index % angle_quantization);    // theta
+      (index / angle_quantization) % width,    // x 坐标
+      index / (angle_quantization * width),    // y 坐标
+      index % angle_quantization);             // theta 角度索引
   }
 
   /**

@@ -35,14 +35,19 @@ namespace nav2_smac_planner
 {
 
 // defining static member for all instance to share
+//大小和grid map一样大，初始值等于0
+//本质是一个vector<float>的数据类型
 LookupTable NodeHybrid::obstacle_heuristic_lookup_table;
 float NodeHybrid::travel_distance_cost = sqrtf(2.0f);
 HybridMotionTable NodeHybrid::motion_table;
 float NodeHybrid::size_lookup = 25;
-LookupTable NodeHybrid::dist_heuristic_lookup_table;
+LookupTable NodeHybrid::dist_heuristic_lookup_table;//这个变量在NodeHybrid::precomputeDistanceHeuristic函数中被更新
 std::shared_ptr<nav2_costmap_2d::Costmap2DROS> NodeHybrid::costmap_ros = nullptr;
 
-ObstacleHeuristicQueue NodeHybrid::obstacle_heuristic_queue;
+//初始值只有一个，本质是一个vector<pair<float, int>>数据结构
+//float存储的是start到goal的欧氏距离，int存储的是goal所在的grid在整个costmap中的索引
+//初始的时候存储的是起点到终点的欧式距离
+ObstacleHeuristicQueue NodeHybrid::obstacle_heuristic_queue;//我认为这个变量存储的是f = g + n的数值
 
 // Each of these tables are the projected motion models through
 // time and space applied to the search on the current node in
@@ -208,9 +213,12 @@ void HybridMotionTable::initReedsShepp(
   min_turning_radius = search_info.minimum_turning_radius;
   motion_model = MotionModel::REEDS_SHEPP;
 
+  // 这里计算的angle是车辆以最小转弯半径绕圆弧运动时，能够覆盖sqrt(2)距离（即对角线距离，保证能覆盖网格单元对角线）的最小转弯角度。
+  // 公式推导：假设车辆以最小转弯半径min_turning_radius绕圆弧，弦长为sqrt(2)（即一个单位网格的对角线长度），
+  // 根据圆弧的弦长公式：L = 2 * r * sin(angle/2)，
+  // 令L = sqrt(2)，r = min_turning_radius，解得angle = 2 * asin(sqrt(2) / (2 * min_turning_radius))
   float angle = 2.0 * asin(sqrt(2.0) / (2 * min_turning_radius));
-  bin_size =
-    2.0f * static_cast<float>(M_PI) / static_cast<float>(num_angle_quantization);
+  bin_size = 2.0f * static_cast<float>(M_PI) / static_cast<float>(num_angle_quantization);//一个bin对应多大的角度
   float increments;
   if (angle < bin_size) {
     increments = 1.0f;
@@ -221,52 +229,46 @@ void HybridMotionTable::initReedsShepp(
 
   const float delta_x = min_turning_radius * sin(angle);
   const float delta_y = min_turning_radius - (min_turning_radius * cos(angle));
-  const float delta_dist = hypotf(delta_x, delta_y);
+  const float delta_dist = hypotf(delta_x, delta_y);//sqrt(x * x + y * y)
 
+  // 我们能够通过下面的公式看出来，小车的body系是x轴向前，y轴向左
+  //1.更新projection
   projections.clear();
   projections.reserve(6);
   projections.emplace_back(delta_dist, 0.0, 0.0, TurnDirection::FORWARD);  // Forward
-  projections.emplace_back(
-    delta_x, delta_y, increments, TurnDirection::LEFT);  // Forward + Left
-  projections.emplace_back(
-    delta_x, -delta_y, -increments, TurnDirection::RIGHT);  // Forward + Right
+  projections.emplace_back( delta_x, delta_y, increments, TurnDirection::LEFT);  // Forward + Left
+  projections.emplace_back( delta_x, -delta_y, -increments, TurnDirection::RIGHT);  // Forward + Right
   projections.emplace_back(-delta_dist, 0.0, 0.0, TurnDirection::REVERSE);  // Backward
-  projections.emplace_back(
-    -delta_x, delta_y, -increments, TurnDirection::REV_LEFT);  // Backward + Left
-  projections.emplace_back(
-    -delta_x, -delta_y, increments, TurnDirection::REV_RIGHT);  // Backward + Right
+  projections.emplace_back(-delta_x, delta_y, -increments, TurnDirection::REV_LEFT);  // Backward + Left
+  projections.emplace_back(-delta_x, -delta_y, increments, TurnDirection::REV_RIGHT);  // Backward + Right
 
+  // 这段代码的主要作用是：当允许插值运动元（allow_primitive_interpolation）且最小转弯角度对应的步数大于1时，
+  // 动态生成更多的运动元（motion primitives），以便在搜索时可以覆盖所有的角度量化区间（angle bins），
+  // 而不仅仅是最极端的转向角度。这样可以让每次搜索扩展时，车辆能够以最小转弯半径约束下，扩展到所有可能的角度bin，
+  // 提高路径搜索的灵活性和覆盖度，减少路径不连续或不自然的情况。
+  // 具体做法是：对于每一个小于最大转弯步数的插值步i，分别计算正向/反向的左转和右转的运动元，并加入到projections列表中。
   if (search_info.allow_primitive_interpolation && increments > 1.0f) {
-    // Create primitives that are +/- N to fill in search space to use all set angular quantizations
-    // Allows us to create N many primitives so that each search iteration can expand into any angle
-    // bin possible with the minimum turning radius constraint, not just the most extreme turns.
     projections.reserve(6 + (4 * (increments - 1)));
     for (unsigned int i = 1; i < static_cast<unsigned int>(increments); i++) {
       const float angle_n = static_cast<float>(i) * bin_size;
       const float turning_rad_n = delta_dist / (2.0f * sin(angle_n / 2.0f));
       const float delta_x_n = turning_rad_n * sin(angle_n);
       const float delta_y_n = turning_rad_n - (turning_rad_n * cos(angle_n));
-      projections.emplace_back(
-        delta_x_n, delta_y_n, static_cast<float>(i), TurnDirection::LEFT);  // Forward + Left
-      projections.emplace_back(
-        delta_x_n, -delta_y_n, -static_cast<float>(i), TurnDirection::RIGHT);  // Forward + Right
-      projections.emplace_back(
-        -delta_x_n, delta_y_n, -static_cast<float>(i),
-        TurnDirection::REV_LEFT);  // Backward + Left
-      projections.emplace_back(
-        -delta_x_n, -delta_y_n, static_cast<float>(i),
-        TurnDirection::REV_RIGHT);  // Backward + Right
+      projections.emplace_back( delta_x_n, delta_y_n, static_cast<float>(i),   TurnDirection::LEFT);  // Forward + Left
+      projections.emplace_back( delta_x_n, -delta_y_n, -static_cast<float>(i), TurnDirection::RIGHT);  // Forward + Right
+      projections.emplace_back( -delta_x_n, delta_y_n, -static_cast<float>(i), TurnDirection::REV_LEFT);  // Backward + Left
+      projections.emplace_back(-delta_x_n, -delta_y_n, static_cast<float>(i),  TurnDirection::REV_RIGHT);  // Backward + Right
     }
   }
 
-  // Create the correct OMPL state space
-  state_space = std::make_shared<ompl::base::ReedsSheppStateSpace>(min_turning_radius);
 
   // Precompute projection deltas
+  //2.更新delta_xs delta_ys trig_values（角度离散化后，每个离散状态对应的实际角度值）
   delta_xs.resize(projections.size());
   delta_ys.resize(projections.size());
   trig_values.resize(num_angle_quantization);
 
+  //每个要到的运动位置，都会有不同的角度分辨率
   for (unsigned int i = 0; i != projections.size(); i++) {
     delta_xs[i].resize(num_angle_quantization);
     delta_ys[i].resize(num_angle_quantization);
@@ -284,6 +286,7 @@ void HybridMotionTable::initReedsShepp(
   }
 
   // Precompute travel costs for each motion primitive
+  //3.整个代码就这里更新了 travel_costs
   travel_costs.resize(projections.size());
   for (unsigned int i = 0; i != projections.size(); i++) {
     const TurnDirection turn_dir = projections[i]._turn_dir;
@@ -291,18 +294,23 @@ void HybridMotionTable::initReedsShepp(
       // Turning, so length is the arc length
       const float arc_angle = projections[i]._theta * bin_size;
       const float turning_rad = delta_dist / (2.0f * sin(arc_angle / 2.0f));
-      travel_costs[i] = turning_rad * arc_angle;
+      travel_costs[i] = turning_rad * arc_angle;//本质上要计算的是弧长！！！
     } else {
       travel_costs[i] = delta_dist;
     }
   }
-}
+}//end function initReedsShepp!!!
 
+
+
+
+//获取这个prjection的世界坐标下的projection信息
 MotionPoses HybridMotionTable::getProjections(const NodeHybrid * node)
 {
   MotionPoses projection_list;
   projection_list.reserve(projections.size());
 
+  //
   for (unsigned int i = 0; i != projections.size(); i++) {
     const MotionPose & proj_motion_model = projections[i];
 
@@ -373,21 +381,26 @@ void NodeHybrid::reset()
   _is_node_valid = false;
 }
 
-bool NodeHybrid::isNodeValid(
-  const bool & traverse_unknown,
-  GridCollisionChecker * collision_checker)
+//判断这个节点和障碍物的关系
+bool NodeHybrid::isNodeValid(const bool & traverse_unknown,
+                              GridCollisionChecker * collision_checker)
 {
   // Already found, we can return the result
   if (!std::isnan(_cell_cost)) {
     return _is_node_valid;
   }
 
-  _is_node_valid = !collision_checker->inCollision(
-    this->pose.x, this->pose.y, this->pose.theta /*bin number*/, traverse_unknown);
+  //非常重要的函数！！！！！！！！！！！！
+  _is_node_valid = !collision_checker->inCollision( this->pose.x, 
+                                                    this->pose.y, 
+                                                    this->pose.theta /*bin number*/, 
+                                                    traverse_unknown);
   _cell_cost = collision_checker->getCost();
   return _is_node_valid;
 }
 
+
+//详见算法实现文档
 float NodeHybrid::getTraversalCost(const NodePtr & child)
 {
   const float normalized_cost = child->getCost() / 252.0f;
@@ -402,6 +415,7 @@ float NodeHybrid::getTraversalCost(const NodePtr & child)
     return NodeHybrid::travel_distance_cost;
   }
 
+  //1.先计算得到一个cost
   const TurnDirection & child_turn_dir = child->getTurnDirection();
   float travel_cost_raw = motion_table.travel_costs[child->getMotionPrimitiveIndex()];
   float travel_cost = 0.0;
@@ -411,10 +425,10 @@ float NodeHybrid::getTraversalCost(const NodePtr & child)
       (motion_table.travel_distance_reward +
       (motion_table.cost_penalty * normalized_cost * normalized_cost));
   } else {
-    travel_cost_raw *=
-      (motion_table.travel_distance_reward + motion_table.cost_penalty * normalized_cost);
+    travel_cost_raw *= (motion_table.travel_distance_reward + motion_table.cost_penalty * normalized_cost);
   }
 
+  //2.根据左右转进行分类
   if (child_turn_dir == TurnDirection::FORWARD || child_turn_dir == TurnDirection::REVERSE) {
     // New motion is a straight motion, no additional costs to be applied
     travel_cost = travel_cost_raw;
@@ -424,11 +438,11 @@ float NodeHybrid::getTraversalCost(const NodePtr & child)
       travel_cost = travel_cost_raw * motion_table.non_straight_penalty;
     } else {
       // Turning motion and changing direction: penalizes wiggling
-      travel_cost = travel_cost_raw *
-        (motion_table.non_straight_penalty + motion_table.change_penalty);
+      travel_cost = travel_cost_raw * (motion_table.non_straight_penalty + motion_table.change_penalty);
     }
   }
 
+  //3.根据是否倒退进行分类
   if (child_turn_dir == TurnDirection::REV_RIGHT ||
     child_turn_dir == TurnDirection::REV_LEFT ||
     child_turn_dir == TurnDirection::REVERSE)
@@ -438,20 +452,22 @@ float NodeHybrid::getTraversalCost(const NodePtr & child)
   }
 
   return travel_cost;
-}
+}//end function getTraversalCost
 
+
+
+
+//超级重要的函数！！！！！！！
 float NodeHybrid::getHeuristicCost(
   const Coordinates & node_coords,
   const CoordinateVector & goals_coords)
 {
   // obstacle heuristic does not depend on goal heading
-  const float obstacle_heuristic =
-    getObstacleHeuristic(node_coords, goals_coords[0], motion_table.cost_penalty);
+  const float obstacle_heuristic = getObstacleHeuristic(node_coords, goals_coords[0], motion_table.cost_penalty);
   float distance_heuristic = std::numeric_limits<float>::max();
   for (unsigned int i = 0; i < goals_coords.size(); i++) {
-    distance_heuristic = std::min(
-      distance_heuristic,
-      getDistanceHeuristic(node_coords, goals_coords[i], obstacle_heuristic));
+    distance_heuristic = std::min( distance_heuristic,
+                                  getDistanceHeuristic(node_coords, goals_coords[i], obstacle_heuristic));
   }
   return std::max(obstacle_heuristic, distance_heuristic);
 }
@@ -466,10 +482,10 @@ void NodeHybrid::initMotionModel(
   // find the motion model selected
   switch (motion_model) {
     case MotionModel::DUBIN:
-      motion_table.initDubin(size_x, size_y, num_angle_quantization, search_info);
+      motion_table.initDubin(size_x, size_y, num_angle_quantization, search_info);//非常重要的函数！！！
       break;
     case MotionModel::REEDS_SHEPP:
-      motion_table.initReedsShepp(size_x, size_y, num_angle_quantization, search_info);
+      motion_table.initReedsShepp(size_x, size_y, num_angle_quantization, search_info);//建议使用这个模型，车辆可以后退！！
       break;
     default:
       throw std::runtime_error(
@@ -481,6 +497,12 @@ void NodeHybrid::initMotionModel(
   travel_distance_cost = motion_table.projections[0]._x;
 }
 
+
+
+// 该函数用于计算二维网格中某一索引(idx)对应的点到目标点(target_x, target_y)的欧氏距离启发式值。
+// idx：当前点在一维数组中的索引
+// size_x：地图的宽度（x方向的网格数）
+// target_x, target_y：目标点的坐标
 inline float distanceHeuristic2D(
   const uint64_t idx, const unsigned int size_x,
   const unsigned int target_x, const unsigned int target_y)
@@ -489,6 +511,7 @@ inline float distanceHeuristic2D(
   int dy = static_cast<int>(idx / size_x) - static_cast<int>(target_y);
   return std::sqrt(dx * dx + dy * dy);
 }
+
 
 void NodeHybrid::resetObstacleHeuristic(
   std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros_i,
@@ -507,8 +530,7 @@ void NodeHybrid::resetObstacleHeuristic(
   unsigned int size_x = 0u;
   if (motion_table.downsample_obstacle_heuristic) {
     size_x = ceil(static_cast<float>(costmap->getSizeInCellsX()) / 2.0f);
-    size = size_x *
-      ceil(static_cast<float>(costmap->getSizeInCellsY()) / 2.0f);
+    size = size_x * ceil(static_cast<float>(costmap->getSizeInCellsY()) / 2.0f);
   } else {
     size_x = costmap->getSizeInCellsX();
     size = size_x * costmap->getSizeInCellsY();
@@ -538,23 +560,29 @@ void NodeHybrid::resetObstacleHeuristic(
     goal_index = floor(goal_y) * size_x + floor(goal_x);
   }
 
-  obstacle_heuristic_queue.emplace_back(
-    distanceHeuristic2D(goal_index, size_x, start_x, start_y), goal_index);
+  obstacle_heuristic_queue.emplace_back( distanceHeuristic2D(goal_index, size_x, start_x, start_y), 
+                                         goal_index);
 
   // initialize goal cell with a very small value to differentiate it from 0.0 (~uninitialized)
   // the negative value means the cell is in the open set
   obstacle_heuristic_lookup_table[goal_index] = -0.00001f;
-}
+}//end funciton resetObstacleHeuristic!!!!!!!
 
+
+
+
+
+//
 float NodeHybrid::getObstacleHeuristic(
   const Coordinates & node_coords,
   const Coordinates &,
   const float & cost_penalty)
 {
+  //1.先计算cost map在x和y方向上一共有多少的维度
   // If already expanded, return the cost
   auto costmap = costmap_ros->getCostmap();
-  unsigned int size_x = 0u;
-  unsigned int size_y = 0u;
+  unsigned int size_x = 0u;//grid map x轴有多少个坐标
+  unsigned int size_y = 0u;//grid map y轴有多少个坐标
   if (motion_table.downsample_obstacle_heuristic) {
     size_x = ceil(static_cast<float>(costmap->getSizeInCellsX()) / 2.0f);
     size_y = ceil(static_cast<float>(costmap->getSizeInCellsY()) / 2.0f);
@@ -590,12 +618,16 @@ float NodeHybrid::getObstacleHeuristic(
   // start_x and start_y have changed since last call
   // we need to recompute 2D distance heuristic and reprioritize queue
   for (auto & n : obstacle_heuristic_queue) {
-    n.first = -obstacle_heuristic_lookup_table[n.second] +
-      distanceHeuristic2D(n.second, size_x, start_x, start_y);
+    //n.second = 终点的索引！！！！
+    //obstacle_heuristic_lookup_table初始值全部等于0
+    n.first = -obstacle_heuristic_lookup_table[n.second] +  distanceHeuristic2D(n.second, size_x, start_x, start_y);
   }
-  std::make_heap(
-    obstacle_heuristic_queue.begin(), obstacle_heuristic_queue.end(),
-    ObstacleHeuristicComparator{});
+
+  //用于将一段随机访问迭代器指定的范围（如数组或 std::vector）转换为一个堆（heap）数据结构。
+  //堆是一种特殊的二叉树结构，通常用于实现优先队列。
+  std::make_heap( obstacle_heuristic_queue.begin(), 
+                  obstacle_heuristic_queue.end(),
+                  ObstacleHeuristicComparator{});
 
   const int size_x_int = static_cast<int>(size_x);
   const float sqrt2 = sqrtf(2.0f);
@@ -603,17 +635,25 @@ float NodeHybrid::getObstacleHeuristic(
   unsigned int mx, my;
   unsigned int idx, new_idx = 0;
 
+  //因为地图是用一维变量存储的，前向增加的是一行的数量！！！！！
   const std::vector<int> neighborhood = {1, -1,  // left right
-    size_x_int, -size_x_int,  // up down
-    size_x_int + 1, size_x_int - 1,  // upper diagonals
-    -size_x_int + 1, -size_x_int - 1};  // lower diagonals
+                                        size_x_int, -size_x_int,  // up down
+                                        size_x_int + 1, size_x_int - 1,  // upper diagonals
+                                        -size_x_int + 1, -size_x_int - 1};  // lower diagonals
 
   while (!obstacle_heuristic_queue.empty()) {
+
+    //2.1 从优先队列中取一个值最小的出来 并且把这个数据从优先队列中删除
     idx = obstacle_heuristic_queue.front().second;
-    std::pop_heap(
-      obstacle_heuristic_queue.begin(), obstacle_heuristic_queue.end(),
-      ObstacleHeuristicComparator{});
+
+    
+    std::pop_heap( obstacle_heuristic_queue.begin(), 
+                   obstacle_heuristic_queue.end(),
+                  ObstacleHeuristicComparator{});
+
     obstacle_heuristic_queue.pop_back();
+
+    //2.2 
     c_cost = obstacle_heuristic_lookup_table[idx];
     if (c_cost > 0.0f) {
       // cell has been processed and closed, no further cost improvements
@@ -624,78 +664,97 @@ float NodeHybrid::getObstacleHeuristic(
     obstacle_heuristic_lookup_table[idx] = c_cost;  // set a positive value to close the cell
 
     // find neighbors
+    //2.2 遍历当前grid周围上下左右的grid
     for (unsigned int i = 0; i != neighborhood.size(); i++) {
-      new_idx = static_cast<unsigned int>(static_cast<int>(idx) + neighborhood[i]);
+          new_idx = static_cast<unsigned int>(static_cast<int>(idx) + neighborhood[i]);
 
-      // if neighbor path is better and non-lethal, set new cost and add to queue
-      if (new_idx < size_x * size_y) {
-        if (downsample_H) {
-          // Get costmap values as if downsampled
-          unsigned int y_offset = (new_idx / size_x) * 2;
-          unsigned int x_offset = (new_idx - ((new_idx / size_x) * size_x)) * 2;
-          cost = costmap->getCost(x_offset, y_offset);
-          for (unsigned int k = 0; k < 2u; ++k) {
-            unsigned int mxd = x_offset + k;
-            if (mxd >= costmap->getSizeInCellsX()) {
-              continue;
-            }
-            for (unsigned int j = 0; j < 2u; ++j) {
-              unsigned int myd = y_offset + j;
-              if (myd >= costmap->getSizeInCellsY()) {
-                continue;
-              }
-              if (k == 0 && j == 0) {
-                continue;
-              }
-              cost = std::min(cost, static_cast<float>(costmap->getCost(mxd, myd)));
-            }
+          // if neighbor path is better and non-lethal, set new cost and add to queue
+           //如果上下左右的grid在地图的范围内
+          if (new_idx < size_x * size_y) {
+                //判读邻居的邻居的前后左右的四个grid是cost更小，如果更小选用更小的cost
+                if (downsample_H) {
+                  // Get costmap values as if downsampled
+                  unsigned int y_offset = (new_idx / size_x) * 2;
+                  unsigned int x_offset = (new_idx - ((new_idx / size_x) * size_x)) * 2;
+                  cost = costmap->getCost(x_offset, y_offset);//从地图中获取邻局grid的占用cost
+                  for (unsigned int k = 0; k < 2u; ++k) {
+                    unsigned int mxd = x_offset + k;
+                    if (mxd >= costmap->getSizeInCellsX()) {
+                      continue;
+                    }
+                    for (unsigned int j = 0; j < 2u; ++j) {
+                      unsigned int myd = y_offset + j;
+                      if (myd >= costmap->getSizeInCellsY()) {
+                        continue;
+                      }
+                      if (k == 0 && j == 0) {
+                        continue;
+                      }
+                      cost = std::min(cost, static_cast<float>(costmap->getCost(mxd, myd)));
+                    }
+                  }
+                } else {
+                  cost = static_cast<float>(costmap->getCost(new_idx));
+                }
+                
+                //如果cost太大 则直接跳过下面的处理
+                if (cost >= INSCRIBED_COST) {
+                  continue;
+                }
+
+                // 这段代码的目的是过滤掉地图边缘的格子，避免在靠近地图边界（距离边界小于等于3格）的位置进行启发式代价的更新。
+                // 具体做法是：计算当前邻居格子的x、y坐标（mx, my），如果该格子距离地图边界太近（小于等于3或大于等于size-3），则跳过该格子的处理。
+                my = new_idx / size_x;
+                mx = new_idx - (my * size_x);
+
+                if (mx >= size_x - 3 || mx <= 3) {
+                  continue;
+                }
+                if (my >= size_y - 3 || my <= 3) {
+                  continue;
+                }
+
+                existing_cost = obstacle_heuristic_lookup_table[new_idx];
+                // existing_cost 小于等于0表示该格子还未被访问过（0.0f），或者该格子已在open set中（负值，存储为负的代价值）
+                if (existing_cost <= 0.0f) {//还没有被访问过
+                  // use_quadratic_cost_penalty变量的含义是：motion_table.use_quadratic_cost_penalty 表示是否在计算travel_cost时使用二次代价惩罚（cost penalty），
+                  // 如果为true，则采用二次型的cost惩罚项（cost*cost），否则采用线性的cost惩罚项。
+                  if (motion_table.use_quadratic_cost_penalty) {
+                    travel_cost = (i <= 3 ? 1.0f : sqrt2) * (1.0f + (cost_penalty * cost * cost / 63504.0f));  // 252^2
+                  } else {
+                    // 这里的travel_cost计算公式为：
+                    // ((i <= 3) ? 1.0f : sqrt2) * (1.0f + (cost_penalty * cost / 252.0f))
+                    // 解释如下：
+                    // 1. (i <= 3) ? 1.0f : sqrt2 ：
+                    //    这里i表示邻居格子的方向索引，i<=3时为直连邻居（上下左右），代价为1.0f；
+                    //    i>3时为对角邻居，代价为sqrt2（约1.414），符合八连通栅格地图的移动距离。
+                    // 2. (1.0f + (cost_penalty * cost / 252.0f)) ：
+                    //    cost为该格子的占用代价（0~252），cost_penalty为代价惩罚系数。
+                    //    这里将cost归一化到0~1区间（除以252），再乘以cost_penalty，最后加1，表示在基础移动代价上叠加环境代价的惩罚。
+                    //    这样可以让路径更倾向于避开高代价区域（如障碍物边缘），但又不会完全不可达。
+                    travel_cost = ((i <= 3) ? 1.0f : sqrt2) * (1.0f + (cost_penalty * cost / 252.0f));
+                  }
+
+                  new_cost = c_cost + travel_cost;
+                  // 这个条件的意思是：如果该格子还没有被访问过（existing_cost == 0.0f），
+                  // 或者该格子已经在open set中但当前计算得到的总代价new_cost比之前记录的更小（-existing_cost > new_cost），
+                  // 则需要更新该格子的代价值和open set。
+                  if (existing_cost == 0.0f || -existing_cost > new_cost) {
+                    // the negative value means the cell is in the open set
+                    obstacle_heuristic_lookup_table[new_idx] = -new_cost;
+                    obstacle_heuristic_queue.emplace_back( new_cost + distanceHeuristic2D(new_idx, size_x, start_x, start_y), new_idx);
+                    std::push_heap(obstacle_heuristic_queue.begin(), 
+                                   obstacle_heuristic_queue.end(),
+                                    ObstacleHeuristicComparator{});
+                  }
+                }
           }
-        } else {
-          cost = static_cast<float>(costmap->getCost(new_idx));
-        }
-
-        if (cost >= INSCRIBED_COST) {
-          continue;
-        }
-
-        my = new_idx / size_x;
-        mx = new_idx - (my * size_x);
-
-        if (mx >= size_x - 3 || mx <= 3) {
-          continue;
-        }
-        if (my >= size_y - 3 || my <= 3) {
-          continue;
-        }
-
-        existing_cost = obstacle_heuristic_lookup_table[new_idx];
-        if (existing_cost <= 0.0f) {
-          if (motion_table.use_quadratic_cost_penalty) {
-            travel_cost =
-              (i <= 3 ? 1.0f : sqrt2) * (1.0f + (cost_penalty * cost * cost / 63504.0f));  // 252^2
-          } else {
-            travel_cost =
-              ((i <= 3) ? 1.0f : sqrt2) * (1.0f + (cost_penalty * cost / 252.0f));
-          }
-
-          new_cost = c_cost + travel_cost;
-          if (existing_cost == 0.0f || -existing_cost > new_cost) {
-            // the negative value means the cell is in the open set
-            obstacle_heuristic_lookup_table[new_idx] = -new_cost;
-            obstacle_heuristic_queue.emplace_back(
-              new_cost + distanceHeuristic2D(new_idx, size_x, start_x, start_y), new_idx);
-            std::push_heap(
-              obstacle_heuristic_queue.begin(), obstacle_heuristic_queue.end(),
-              ObstacleHeuristicComparator{});
-          }
-        }
-      }
-    }
+    }//遍历邻居结束！！！！
 
     if (idx == start_index) {
       break;
     }
-  }
+  }//end while循环！！！！
 
   // #include "nav_msgs/msg/occupancy_grid.hpp"
   // static auto node = std::make_shared<rclcpp::Node>("test");
@@ -717,10 +776,14 @@ float NodeHybrid::getObstacleHeuristic(
   // return requested_node_cost which has been updated by the search
   // costs are doubled due to downsampling
   return downsample_H ? 2.0f * requested_node_cost : requested_node_cost;
-}
+}//end function getObstacleHeuristic！！！！
 
+
+
+
+//详见算法实现文档
 float NodeHybrid::getDistanceHeuristic(
-  const Coordinates & node_coords,
+  const Coordinates & node_coords,//我个人认为这里的坐标因该是gird地图中的栅格坐标！！！！！
   const Coordinates & goal_coords,
   const float & obstacle_heuristic)
 {
@@ -731,25 +794,37 @@ float NodeHybrid::getDistanceHeuristic(
 
   // This angle is negative since we are de-rotating the current node
   // by the goal angle; cos(-th) = cos(th) & sin(-th) = -sin(th)
+  //1.将出发点的坐标变换到以目标的pose为原点的坐标系下；
+  // 1.1 获取目标点朝向对应的三角函数值（cos和sin），用于后续坐标变换
   const TrigValues & trig_vals = motion_table.trig_values[goal_coords.theta];
+  // 1.2 取出cos值
   const float cos_th = trig_vals.first;
+  // 1.3 取出sin值并取相反数（因为后续要做坐标系旋转，旋转角度为负）
   const float sin_th = -trig_vals.second;
+  // 1.4 计算当前节点与目标节点在x、y方向的差值
   const float dx = node_coords.x - goal_coords.x;
   const float dy = node_coords.y - goal_coords.y;
-
+  // 1.5. 计算当前节点与目标节点的角度差（离散角度bin）
   double dtheta_bin = node_coords.theta - goal_coords.theta;
+  // 1.6. 如果角度差为负，则加上角度离散数，保证角度在合法范围内
   if (dtheta_bin < 0) {
     dtheta_bin += motion_table.num_angle_quantization;
   }
+  // 1.7. 如果角度差大于最大离散数，则减去离散数，保证角度在合法范围内
   if (dtheta_bin > motion_table.num_angle_quantization) {
     dtheta_bin -= motion_table.num_angle_quantization;
   }
-
+  //1.8 将当前节点的坐标（相对于目标点）旋转到以目标点为原点、目标朝向为x轴的坐标系下
+  //    这样可以方便查表和启发式计算
+  //    其中x' = dx * cos - dy * sin，y' = dx * sin + dy * cos
+  //    角度直接用离散bin差
   Coordinates node_coords_relative(
     round(dx * cos_th - dy * sin_th),
     round(dx * sin_th + dy * cos_th),
     round(dtheta_bin));
 
+
+  //2.
   // Check if the relative node coordinate is within the localized window around the goal
   // to apply the distance heuristic. Since the lookup table is contains only the positive
   // X axis, we mirror the Y and theta values across the X axis to find the heuristic values.
@@ -767,10 +842,9 @@ float NodeHybrid::getDistanceHeuristic(
     }
     const int x_pos = node_coords_relative.x + floored_size;
     const int y_pos = static_cast<int>(mirrored_relative_y);
-    const int index =
-      x_pos * ceiling_size * motion_table.num_angle_quantization +
-      y_pos * motion_table.num_angle_quantization +
-      theta_pos;
+    const int index = x_pos * ceiling_size * motion_table.num_angle_quantization +
+                      y_pos * motion_table.num_angle_quantization +
+                      theta_pos;
     motion_heuristic = dist_heuristic_lookup_table[index];
   } else if (obstacle_heuristic <= 0.0) {
     // If no obstacle heuristic value, must have some H to use
@@ -788,6 +862,7 @@ float NodeHybrid::getDistanceHeuristic(
   return motion_heuristic;
 }
 
+//这个函数的具体作用详见算法实现文档
 void NodeHybrid::precomputeDistanceHeuristic(
   const float & lookup_table_dim,
   const MotionModel & motion_model,
@@ -795,12 +870,11 @@ void NodeHybrid::precomputeDistanceHeuristic(
   const SearchInfo & search_info)
 {
   // Dubin or Reeds-Shepp shortest distances
-  if (motion_model == MotionModel::DUBIN) {
+  if (motion_model == MotionModel::DUBIN) {//这个模型只能前向控制
     motion_table.state_space = std::make_shared<ompl::base::DubinsStateSpace>(
       search_info.minimum_turning_radius);
-  } else if (motion_model == MotionModel::REEDS_SHEPP) {
-    motion_table.state_space = std::make_shared<ompl::base::ReedsSheppStateSpace>(
-      search_info.minimum_turning_radius);
+  } else if (motion_model == MotionModel::REEDS_SHEPP) {//这个动力学模型是可以前后控制的，建议看这个条件
+    motion_table.state_space = std::make_shared<ompl::base::ReedsSheppStateSpace>(search_info.minimum_turning_radius);
   } else {
     throw std::runtime_error(
             "Node attempted to precompute distance heuristics "
@@ -822,6 +896,14 @@ void NodeHybrid::precomputeDistanceHeuristic(
   // Heuristic space, we need to only store 2 of the 4 quadrants and simply mirror
   // around the X axis any relative node lookup. This reduces memory overhead and increases
   // the size of a window a platform can store in memory.
+  
+  //详见算法实现文档
+  // 这里的公式是为了分配启发式查找表（dist_heuristic_lookup_table）的内存空间。
+  // 由于 Dubin/Reeds-Shepp 距离的对称性，只需要存储目标点周围窗口的 1/2 区域（即 y >= 0 的一半），
+  // 这样可以节省一半的内存。size_lookup 表示查找表在 x 方向的像素宽度，
+  // ceil(size_lookup / 2.0) 表示 y 方向只取一半（向上取整），
+  // dim_3_size_int 表示角度分辨率的数量（即每个位置存储不同角度的距离）。
+  // 所以总的查找表大小 = x 方向 * y 方向（只取一半）* 角度分辨率。
   dist_heuristic_lookup_table.resize(size_lookup * ceil(size_lookup / 2.0) * dim_3_size_int);
   for (float x = ceil(-size_lookup / 2.0); x <= floor(size_lookup / 2.0); x += 1.0) {
     for (float y = 0.0; y <= floor(size_lookup / 2.0); y += 1.0) {
@@ -829,13 +911,17 @@ void NodeHybrid::precomputeDistanceHeuristic(
         from[0] = x;
         from[1] = y;
         from[2] = heading * angular_bin_size;
+        // 这行代码的作用是：计算从当前状态 from 到目标状态 to 的 Dubins 或 Reeds-Shepp 距离（即最短可行路径长度），
+        // 作为启发式查找表的一个元素，用于后续A*搜索的启发式代价估算。
         motion_heuristic = motion_table.state_space->distance(from(), to());
         dist_heuristic_lookup_table[index] = motion_heuristic;
         index++;
       }
     }
   }
-}
+}//end function precomputeDistanceHeuristic
+
+
 
 void NodeHybrid::getNeighbors(
   std::function<bool(const uint64_t &,
@@ -847,9 +933,12 @@ void NodeHybrid::getNeighbors(
   uint64_t index = 0;
   NodePtr neighbor = nullptr;
   Coordinates initial_node_coords;
+  //1.根据这个node全局信息，获取这个node的prjection的世界坐标下的projection信息
   const MotionPoses motion_projections = motion_table.getProjections(this);
 
+  //2.
   for (unsigned int i = 0; i != motion_projections.size(); i++) {
+    //获取这个proejction点在cost map的唯一index
     index = NodeHybrid::getIndex(
       static_cast<unsigned int>(motion_projections[i]._x),
       static_cast<unsigned int>(motion_projections[i]._y),
@@ -860,11 +949,9 @@ void NodeHybrid::getNeighbors(
       // Cache the initial pose in case it was visited but valid
       // don't want to disrupt continuous coordinate expansion
       initial_node_coords = neighbor->pose;
-      neighbor->setPose(
-        Coordinates(
-          motion_projections[i]._x,
-          motion_projections[i]._y,
-          motion_projections[i]._theta));
+      neighbor->setPose( Coordinates( motion_projections[i]._x,
+                                      motion_projections[i]._y,
+                                      motion_projections[i]._theta));
       if (neighbor->isNodeValid(traverse_unknown, collision_checker)) {
         neighbor->setMotionPrimitiveIndex(i, motion_projections[i]._turn_dir);
         neighbors.push_back(neighbor);
@@ -873,8 +960,10 @@ void NodeHybrid::getNeighbors(
       }
     }
   }
-}
+}//end function getNeighbors!!!!
 
+
+//
 bool NodeHybrid::backtracePath(CoordinateVector & path)
 {
   if (!this->parent) {
